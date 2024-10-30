@@ -1,0 +1,122 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from torch.utils.data import Dataset, DataLoader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Load Data
+raw_behaviour = pd.read_csv('behaviors.tsv', sep='\t', names=["impressionId", "userId", "timestamp", "click_history", "impressions"])
+news = pd.read_csv("news.tsv", sep="\t", names=["itemId", "category", "subcategory", "title", "abstract", "url", "title_entities", "abstract_entities"])
+
+# Index Users and Items
+unique_userIds = raw_behaviour['userId'].unique()
+ind2user = {idx + 1: userId for idx, userId in enumerate(unique_userIds)}
+user2ind = {userId: idx for idx, userId in ind2user.items()}
+raw_behaviour['userIdx'] = raw_behaviour['userId'].map(lambda x: user2ind.get(x, 0))
+
+ind2item = {idx + 1: itemId for idx, itemId in enumerate(news['itemId'].values)}
+item2ind = {itemId: idx for idx, itemId in ind2item.items()}
+
+# Process click history and impressions
+def process_click_history(s):
+    list_of_strings = str(s).split(" ")
+    return [item2ind.get(l, 0) for l in list_of_strings]
+        
+raw_behaviour['click_history_idx'] = raw_behaviour['click_history'].map(process_click_history)
+
+def process_impression(s):
+    list_of_strings = s.split(" ")
+    itemid_rel_tuple = [l.split("-") for l in list_of_strings]
+    noclicks = []
+    for entry in itemid_rel_tuple:
+        if entry[1] == '0':
+            noclicks.append(entry[0])
+        elif entry[1] == '1':
+            click = entry[0]
+    return noclicks, click
+
+raw_behaviour['noclicks'], raw_behaviour['click'] = zip(*raw_behaviour['impressions'].map(process_impression))
+raw_behaviour['noclicks'] = raw_behaviour['noclicks'].map(lambda list_of_strings: [item2ind.get(l, 0) for l in list_of_strings])
+raw_behaviour['click'] = raw_behaviour['click'].map(lambda x: item2ind.get(x, 0))
+raw_behaviour['epochhrs'] = pd.to_datetime(raw_behaviour['timestamp']).values.astype(np.int64) / 1e9 / 3600
+raw_behaviour['epochhrs'] = raw_behaviour['epochhrs'].round()
+
+# Prepare Train and Validation Sets
+behaviour = raw_behaviour[['epochhrs', 'userIdx', 'click_history_idx', 'noclicks', 'click']]
+behaviour.loc[:, 'noclick'] = behaviour['noclicks'].map(lambda x: x[0])
+
+test_time_th = behaviour['epochhrs'].quantile(0.9)
+train = behaviour[behaviour['epochhrs'] < test_time_th]
+valid = behaviour[behaviour['epochhrs'] >= test_time_th]
+
+# Dataset and DataLoader
+class MindDataset(Dataset):
+    def __init__(self, df):
+        self.data = {
+            'userIdx': torch.tensor(df.userIdx.values),
+            'click': torch.tensor(df.click.values),
+            'noclick': torch.tensor(df.noclick.values)
+        }
+    
+    def __len__(self):
+        return len(self.data['userIdx'])
+    
+    def __getitem__(self, idx):
+        return {key: val[idx] for key, val in self.data.items()}
+
+bs = 1024
+ds_train = MindDataset(train)
+train_loader = DataLoader(ds_train, batch_size=bs, shuffle=True)
+ds_valid = MindDataset(valid)
+valid_loader = DataLoader(ds_valid, batch_size=bs, shuffle=False)
+
+# Define Model
+class NewsMF(pl.LightningModule):
+    def __init__(self, num_users, num_items, dim=10):
+        super().__init__()
+        self.dim = dim
+        self.useremb = nn.Embedding(num_embeddings=num_users, embedding_dim=dim)
+        self.itememb = nn.Embedding(num_embeddings=num_items, embedding_dim=dim)
+    
+    def forward(self, user_idxs, item_idxs):
+        user_embedding = self.useremb(user_idxs)
+        item_embedding = self.itememb(item_idxs)
+        return (user_embedding * item_embedding).sum(dim=1)
+    
+    def training_step(self, batch, batch_idx):
+        click_pred = self(batch['userIdx'], batch['click'])
+        noclick_pred = self(batch['userIdx'], batch['noclick'])
+        loss = -F.logsigmoid(click_pred - noclick_pred).mean()
+        return loss
+    
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=0.01)
+
+# Train the Model
+mf_model = NewsMF(num_users=len(ind2user) + 1, num_items=len(ind2item) + 1)
+trainer = pl.Trainer(max_epochs=5, accelerator="cpu")
+trainer.fit(mf_model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+
+# Recommendation Function Based on Abstract
+def recommend_based_on_abstract(model, user_abstract, news_df, top_n=5):
+    vectorizer = TfidfVectorizer()
+    all_abstracts = news_df['abstract'].fillna("").tolist()
+    abstract_vectors = vectorizer.fit_transform(all_abstracts)
+    user_abstract_vector = vectorizer.transform([user_abstract])
+    similarities = cosine_similarity(user_abstract_vector, abstract_vectors).flatten()
+    top_indices = similarities.argsort()[-top_n:][::-1]
+    recommended_items = [ind2item.get(idx + 1, "Unknown") for idx in top_indices]
+    return news_df.iloc[top_indices][['title', 'abstract']]
+
+
+
+# Get Recommendations
+user_input = input("Enter an abstract related to your interest: ")
+recommended_articles = recommend_based_on_abstract(mf_model, user_input, news)
+print("Recommended Articles:")
+pd.set_option("display.max_colwidth", None)
+print(recommended_articles)
